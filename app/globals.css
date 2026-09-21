@@ -141,3 +141,22 @@ textarea { resize: vertical; }
   .activity-actions .small-btn, .activity-actions .ghost-btn { flex: 1; }
   .goal-control { align-items: flex-start; }
 }
+
+.head-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+.cloud-chip { display: inline-flex; align-items: center; gap: 7px; min-height: 38px; padding: 7px 10px; border: 1px solid var(--line); background: #fff; border-radius: 999px; color: var(--muted); font-size: 12px; }
+.cloud-chip button { border: 0; border-left: 1px solid var(--line); background: transparent; color: #596275; padding: 0 0 0 8px; font-size: 12px; font-weight: 600; }
+
+.auth-shell { min-height: 100vh; display: grid; place-items: center; padding: 28px 18px; }
+.auth-card { width: min(460px, 100%); background: #fff; border: 1px solid var(--line); border-radius: 22px; padding: 30px; box-shadow: var(--shadow); }
+.auth-card h1 { font-size: clamp(30px, 6vw, 42px); margin-bottom: 8px; }
+.auth-mark { width: 46px; height: 46px; border-radius: 13px; display: grid; place-items: center; background: var(--pink); color: #fff; font-weight: 800; font-size: 21px; margin-bottom: 24px; box-shadow: 0 8px 20px rgba(255,79,139,.22); }
+.auth-form { display: grid; gap: 14px; margin-top: 24px; }
+.auth-form label { color: #4c5669; font-size: 13px; font-weight: 600; }
+.auth-message { margin: 14px 0 0; padding: 10px 12px; border-radius: 10px; background: var(--soft); color: #596275; font-size: 13px; }
+
+@media (max-width: 560px) {
+  .head-actions { width: 100%; justify-content: stretch; }
+  .head-actions .cloud-chip { width: 100%; justify-content: space-between; }
+  .head-actions .primary { width: 100%; }
+  .auth-card { padding: 22px; border-radius: 18px; }
+}

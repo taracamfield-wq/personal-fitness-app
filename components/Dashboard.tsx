@@ -1,11 +1,14 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import type { Session } from "@supabase/supabase-js";
 import type { ActivityCategory, FitnessState, Measurement, PlannedActivity } from "../lib/types";
-import { loadState, saveState } from "../lib/storage";
+import { loadCloudCache, loadStoredState, saveCloudCache } from "../lib/storage";
+import { getSupabaseClient } from "../lib/supabase";
 
 const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 const categories: ActivityCategory[] = ["Run", "Strength", "Walk", "Mobility", "Other"];
+const emptyState: FitnessState = { plannedActivities: [], measurements: [], maintenanceCeiling: 125 };
 
 function localDateISO(date: Date) {
   const y = date.getFullYear();
@@ -40,38 +43,10 @@ function formatRange(start: Date) {
   const startYear = start.getFullYear();
   const endYear = end.getFullYear();
 
-  if (startYear === endYear && start.getMonth() === end.getMonth()) {
-    return `${startMonth} ${startDay}–${endDay}, ${startYear}`;
-  }
-  if (startYear === endYear) {
-    return `${startMonth} ${startDay}–${endMonth} ${endDay}, ${startYear}`;
-  }
+  if (startYear === endYear && start.getMonth() === end.getMonth()) return `${startMonth} ${startDay}–${endDay}, ${startYear}`;
+  if (startYear === endYear) return `${startMonth} ${startDay}–${endMonth} ${endDay}, ${startYear}`;
   return `${startMonth} ${startDay}, ${startYear}–${endMonth} ${endDay}, ${endYear}`;
 }
-
-function uid(prefix: string) {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function seedActivities(weekStart: Date): PlannedActivity[] {
-  const dateFor = (dayIndex: number) => localDateISO(addDays(weekStart, dayIndex));
-  return [
-    { id: uid("a"), date: dateFor(0), title: "Stretch + recovery", category: "Mobility", target: "10–15 min", status: "planned", source: "manual" },
-    { id: uid("a"), date: dateFor(1), title: "Morning walk", category: "Walk", target: "Easy / fasted if desired", status: "planned", source: "manual" },
-    { id: uid("a"), date: dateFor(2), title: "Zone 2 run", category: "Run", target: "45–60 min", targetMiles: 4, status: "planned", source: "manual" },
-    { id: uid("a"), date: dateFor(3), title: "Strength", category: "Strength", target: "15–20 min", status: "planned", source: "manual" },
-    { id: uid("a"), date: dateFor(4), title: "Morning walk", category: "Walk", target: "30+ min", status: "planned", source: "manual" },
-    { id: uid("a"), date: dateFor(5), title: "Zone 2 run", category: "Run", target: "Easy", targetMiles: 4, status: "planned", source: "manual" },
-    { id: uid("a"), date: dateFor(6), title: "Long run", category: "Run", target: "Build gradually", targetMiles: 7, status: "planned", source: "manual" },
-  ];
-}
-
-const initialWeekStart = startOfWeek();
-const initialState: FitnessState = {
-  plannedActivities: seedActivities(initialWeekStart),
-  measurements: [],
-  maintenanceCeiling: 125,
-};
 
 function average(values: number[]) {
   if (!values.length) return undefined;
@@ -88,6 +63,31 @@ function weightStats(measurements: Measurement[]) {
   const current = measurements.filter((m) => typeof m.weight === "number" && daysAgo(m.date) >= 0 && daysAgo(m.date) < 30).map((m) => m.weight as number);
   const previous = measurements.filter((m) => typeof m.weight === "number" && daysAgo(m.date) >= 30 && daysAgo(m.date) < 60).map((m) => m.weight as number);
   return { current: average(current), previous: average(previous), count: current.length };
+}
+
+function mapActivity(row: Record<string, any>): PlannedActivity {
+  return {
+    id: String(row.id),
+    date: String(row.activity_date),
+    title: String(row.title),
+    category: row.category as ActivityCategory,
+    target: row.target || undefined,
+    targetMiles: row.target_miles == null ? undefined : Number(row.target_miles),
+    status: row.status,
+    actualMiles: row.actual_miles == null ? undefined : Number(row.actual_miles),
+    actualMinutes: row.actual_minutes == null ? undefined : Number(row.actual_minutes),
+    notes: row.notes || undefined,
+    source: row.source || "manual",
+  };
+}
+
+function mapMeasurement(row: Record<string, any>): Measurement {
+  return {
+    id: String(row.id),
+    date: String(row.measured_on),
+    weight: row.weight == null ? undefined : Number(row.weight),
+    waist: row.waist == null ? undefined : Number(row.waist),
+  };
 }
 
 function WeightSparkline({ measurements }: { measurements: Measurement[] }) {
@@ -116,15 +116,22 @@ function WeightSparkline({ measurements }: { measurements: Measurement[] }) {
 }
 
 export default function Dashboard() {
-  const [state, setState] = useState<FitnessState>(initialState);
-  const [hydrated, setHydrated] = useState(false);
+  const supabase = useMemo(() => getSupabaseClient(), []);
+  const [session, setSession] = useState<Session | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [email, setEmail] = useState("");
+  const [authMessage, setAuthMessage] = useState("");
+  const [state, setState] = useState<FitnessState>(() => loadCloudCache() || emptyState);
+  const [cloudLoading, setCloudLoading] = useState(true);
+  const [syncMessage, setSyncMessage] = useState("Cloud sync");
   const [showAdd, setShowAdd] = useState(false);
   const [addCategory, setAddCategory] = useState<ActivityCategory>("Run");
   const [logging, setLogging] = useState<PlannedActivity | null>(null);
   const [editing, setEditing] = useState<PlannedActivity | null>(null);
   const [editCategory, setEditCategory] = useState<ActivityCategory>("Run");
   const [editTitle, setEditTitle] = useState("");
-  const [viewWeekStartIso, setViewWeekStartIso] = useState(localDateISO(initialWeekStart));
+  const [viewWeekStartIso, setViewWeekStartIso] = useState(localDateISO(startOfWeek()));
+  const loadingUserRef = useRef<string | null>(null);
 
   const viewedWeekStart = useMemo(() => parseLocalDate(viewWeekStartIso), [viewWeekStartIso]);
   const currentWeekStartIso = localDateISO(startOfWeek());
@@ -132,13 +139,288 @@ export default function Dashboard() {
   const isCurrentWeek = viewWeekStartIso === currentWeekStartIso;
 
   useEffect(() => {
-    setState(loadState(initialState));
-    setHydrated(true);
-  }, []);
+    if (!supabase) {
+      setAuthLoading(false);
+      setCloudLoading(false);
+      return;
+    }
+    let mounted = true;
+    supabase.auth.getSession().then(({ data }) => {
+      if (!mounted) return;
+      setSession(data.session);
+      setAuthLoading(false);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      if (!mounted) return;
+      setSession(nextSession);
+      setAuthLoading(false);
+    });
+    return () => {
+      mounted = false;
+      listener.subscription.unsubscribe();
+    };
+  }, [supabase]);
 
   useEffect(() => {
-    if (hydrated) saveState(state);
-  }, [state, hydrated]);
+    if (!session?.user.id || !supabase) {
+      if (!session) setCloudLoading(false);
+      return;
+    }
+    if (loadingUserRef.current === session.user.id) return;
+    loadingUserRef.current = session.user.id;
+    void loadCloudState(session.user.id);
+  }, [session?.user.id, supabase]);
+
+  useEffect(() => {
+    saveCloudCache(state);
+  }, [state]);
+
+  async function loadCloudState(userId: string) {
+    if (!supabase) return;
+    setCloudLoading(true);
+    setSyncMessage("Syncing…");
+    try {
+      let [profileRes, activitiesRes, measurementsRes] = await Promise.all([
+        supabase.from("profiles").select("maintenance_ceiling").eq("id", userId).maybeSingle(),
+        supabase.from("planned_activities").select("*").eq("user_id", userId).order("activity_date", { ascending: true }),
+        supabase.from("measurements").select("*").eq("user_id", userId).order("measured_on", { ascending: true }),
+      ]);
+      if (profileRes.error) throw profileRes.error;
+      if (activitiesRes.error) throw activitiesRes.error;
+      if (measurementsRes.error) throw measurementsRes.error;
+
+      const noCloudData = !profileRes.data && !(activitiesRes.data?.length) && !(measurementsRes.data?.length);
+      const local = loadStoredState();
+      if (noCloudData && local) {
+        const profileInsert = await supabase.from("profiles").upsert({ id: userId, maintenance_ceiling: local.maintenanceCeiling || 125 });
+        if (profileInsert.error) throw profileInsert.error;
+
+        if (local.plannedActivities.length) {
+          const activityInsert = await supabase.from("planned_activities").insert(local.plannedActivities.map((a) => ({
+            user_id: userId,
+            activity_date: a.date,
+            title: a.title,
+            category: a.category,
+            target: a.target || null,
+            target_miles: a.targetMiles ?? null,
+            status: a.status,
+            actual_miles: a.actualMiles ?? null,
+            actual_minutes: a.actualMinutes ?? null,
+            notes: a.notes || null,
+            source: a.source || "manual",
+          })));
+          if (activityInsert.error) throw activityInsert.error;
+        }
+        if (local.measurements.length) {
+          const measurementInsert = await supabase.from("measurements").upsert(local.measurements.map((m) => ({
+            user_id: userId,
+            measured_on: m.date,
+            weight: m.weight ?? null,
+            waist: m.waist ?? null,
+          })), { onConflict: "user_id,measured_on" });
+          if (measurementInsert.error) throw measurementInsert.error;
+        }
+
+        [profileRes, activitiesRes, measurementsRes] = await Promise.all([
+          supabase.from("profiles").select("maintenance_ceiling").eq("id", userId).maybeSingle(),
+          supabase.from("planned_activities").select("*").eq("user_id", userId).order("activity_date", { ascending: true }),
+          supabase.from("measurements").select("*").eq("user_id", userId).order("measured_on", { ascending: true }),
+        ]);
+        setSyncMessage("Browser data moved to cloud");
+      } else {
+        if (!profileRes.data) {
+          const createProfile = await supabase.from("profiles").upsert({ id: userId, maintenance_ceiling: 125 }).select("maintenance_ceiling").single();
+          if (createProfile.error) throw createProfile.error;
+          profileRes = createProfile;
+        }
+        setSyncMessage("Synced");
+      }
+
+      setState({
+        plannedActivities: (activitiesRes.data || []).map(mapActivity),
+        measurements: (measurementsRes.data || []).map(mapMeasurement),
+        maintenanceCeiling: Number(profileRes.data?.maintenance_ceiling ?? 125),
+      });
+    } catch (error) {
+      console.error(error);
+      setSyncMessage("Sync error");
+    } finally {
+      setCloudLoading(false);
+    }
+  }
+
+  async function sendMagicLink(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!supabase || !email.trim()) return;
+    setAuthMessage("Sending…");
+    const { error } = await supabase.auth.signInWithOtp({
+      email: email.trim(),
+      options: { emailRedirectTo: window.location.origin },
+    });
+    setAuthMessage(error ? error.message : "Check your email for the sign-in link.");
+  }
+
+  async function signOut() {
+    if (!supabase) return;
+    await supabase.auth.signOut();
+    loadingUserRef.current = null;
+    setSession(null);
+  }
+
+  async function addPlannedActivity(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!supabase || !session?.user.id) return;
+    const form = new FormData(e.currentTarget);
+    const date = String(form.get("date") || "");
+    const title = String(form.get("title") || "").trim();
+    const category = String(form.get("category") || "Other") as ActivityCategory;
+    const target = String(form.get("target") || "").trim();
+    const targetMilesRaw = String(form.get("targetMiles") || "").trim();
+    const targetMiles = category === "Run" && targetMilesRaw ? Number(targetMilesRaw) : undefined;
+    if (!date || !title) return;
+    setSyncMessage("Saving…");
+    const { data, error } = await supabase.from("planned_activities").insert({
+      user_id: session.user.id, activity_date: date, title, category, target: target || null,
+      target_miles: Number.isFinite(targetMiles) ? targetMiles : null, status: "planned", source: "manual",
+    }).select("*").single();
+    if (error) return setSyncMessage("Save error");
+    setState((s) => ({ ...s, plannedActivities: [...s.plannedActivities, mapActivity(data)] }));
+    setSyncMessage("Synced");
+    e.currentTarget.reset();
+    setAddCategory("Run");
+    setShowAdd(false);
+  }
+
+  function openEdit(activity: PlannedActivity) {
+    setEditing(activity);
+    setEditCategory(activity.category);
+    setEditTitle(activity.title);
+  }
+
+  async function editPlannedActivity(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!editing || !supabase || !session?.user.id) return;
+    const form = new FormData(e.currentTarget);
+    const date = String(form.get("date") || editing.date);
+    const title = editTitle.trim();
+    const category = String(form.get("category") || editing.category) as ActivityCategory;
+    const target = String(form.get("target") || "").trim();
+    const targetMilesRaw = String(form.get("targetMiles") || "").trim();
+    const targetMiles = category === "Run" && targetMilesRaw ? Number(targetMilesRaw) : undefined;
+    if (!title) return;
+    setSyncMessage("Saving…");
+    const { data, error } = await supabase.from("planned_activities").update({
+      activity_date: date, title, category, target: target || null,
+      target_miles: Number.isFinite(targetMiles) ? targetMiles : null, updated_at: new Date().toISOString(),
+    }).eq("id", editing.id).eq("user_id", session.user.id).select("*").single();
+    if (error) return setSyncMessage("Save error");
+    setState((s) => ({ ...s, plannedActivities: s.plannedActivities.map((a) => a.id === editing.id ? mapActivity(data) : a) }));
+    setSyncMessage("Synced");
+    setEditing(null);
+  }
+
+  async function logActivity(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!logging || !supabase || !session?.user.id) return;
+    const form = new FormData(e.currentTarget);
+    const milesRaw = String(form.get("miles") || "").trim();
+    const minutesRaw = String(form.get("minutes") || "").trim();
+    const notes = String(form.get("notes") || "").trim();
+    const miles = milesRaw ? Math.max(0, Math.min(200, Number(milesRaw))) : undefined;
+    const minutes = minutesRaw ? Math.max(0, Math.min(1000, Number(minutesRaw))) : undefined;
+    setSyncMessage("Saving…");
+    const { data, error } = await supabase.from("planned_activities").update({
+      status: "completed",
+      actual_miles: Number.isFinite(miles) ? miles : null,
+      actual_minutes: Number.isFinite(minutes) ? minutes : null,
+      notes: notes || null,
+      updated_at: new Date().toISOString(),
+    }).eq("id", logging.id).eq("user_id", session.user.id).select("*").single();
+    if (error) return setSyncMessage("Save error");
+    setState((s) => ({ ...s, plannedActivities: s.plannedActivities.map((a) => a.id === logging.id ? mapActivity(data) : a) }));
+    setSyncMessage("Synced");
+    setLogging(null);
+  }
+
+  async function cloneToNextWeek() {
+    if (!supabase || !session?.user.id || !thisWeek.length) return;
+    const nextStart = addDays(viewedWeekStart, 7);
+    const nextDates = dayNames.map((_, i) => localDateISO(addDays(nextStart, i)));
+    const existing = state.plannedActivities.some((a) => nextDates.includes(a.date));
+    if (existing && !window.confirm("The next week already has activities. Add another copy of this week's plan anyway?")) return;
+    const rows = thisWeek.map((a) => ({
+      user_id: session.user.id,
+      activity_date: localDateISO(addDays(nextStart, Math.max(0, weekDates.indexOf(a.date)))),
+      title: a.title,
+      category: a.category,
+      target: a.target || null,
+      target_miles: a.targetMiles ?? null,
+      status: "planned",
+      source: "manual",
+    }));
+    setSyncMessage("Saving…");
+    const { data, error } = await supabase.from("planned_activities").insert(rows).select("*");
+    if (error) return setSyncMessage("Save error");
+    setState((s) => ({ ...s, plannedActivities: [...s.plannedActivities, ...(data || []).map(mapActivity)] }));
+    setSyncMessage("Synced");
+    setViewWeekStartIso(localDateISO(nextStart));
+  }
+
+  async function updateActivityStatus(id: string, status: "planned" | "skipped", clearActual = false) {
+    if (!supabase || !session?.user.id) return;
+    setSyncMessage("Saving…");
+    const patch: Record<string, any> = { status, updated_at: new Date().toISOString() };
+    if (clearActual) Object.assign(patch, { actual_miles: null, actual_minutes: null, notes: null });
+    const { data, error } = await supabase.from("planned_activities").update(patch).eq("id", id).eq("user_id", session.user.id).select("*").single();
+    if (error) return setSyncMessage("Save error");
+    setState((s) => ({ ...s, plannedActivities: s.plannedActivities.map((a) => a.id === id ? mapActivity(data) : a) }));
+    setSyncMessage("Synced");
+  }
+
+  async function remove(id: string) {
+    if (!supabase || !session?.user.id) return;
+    setSyncMessage("Saving…");
+    const { error } = await supabase.from("planned_activities").delete().eq("id", id).eq("user_id", session.user.id);
+    if (error) return setSyncMessage("Save error");
+    setState((s) => ({ ...s, plannedActivities: s.plannedActivities.filter((a) => a.id !== id) }));
+    setSyncMessage("Synced");
+  }
+
+  async function saveMeasurement(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!supabase || !session?.user.id) return;
+    const form = new FormData(e.currentTarget);
+    const date = String(form.get("measureDate") || localDateISO(new Date()));
+    const weightRaw = String(form.get("weight") || "").trim();
+    const waistRaw = String(form.get("waist") || "").trim();
+    const weight = weightRaw ? Number(weightRaw) : undefined;
+    const waist = waistRaw ? Number(waistRaw) : undefined;
+    if ((weight === undefined || !Number.isFinite(weight)) && (waist === undefined || !Number.isFinite(waist))) return;
+    setSyncMessage("Saving…");
+    const { data, error } = await supabase.from("measurements").upsert({
+      user_id: session.user.id,
+      measured_on: date,
+      weight: weight && weight > 0 ? weight : null,
+      waist: waist && waist > 0 ? waist : null,
+    }, { onConflict: "user_id,measured_on" }).select("*").single();
+    if (error) return setSyncMessage("Save error");
+    const entry = mapMeasurement(data);
+    setState((s) => ({ ...s, measurements: [...s.measurements.filter((m) => m.date !== date), entry].sort((a, b) => a.date.localeCompare(b.date)) }));
+    setSyncMessage("Synced");
+    e.currentTarget.reset();
+  }
+
+  function updateCeiling(value: string) {
+    const num = Number(value);
+    if (Number.isFinite(num) && num >= 80 && num <= 300) setState((s) => ({ ...s, maintenanceCeiling: num }));
+  }
+
+  async function saveCeiling() {
+    if (!supabase || !session?.user.id) return;
+    setSyncMessage("Saving…");
+    const { error } = await supabase.from("profiles").upsert({ id: session.user.id, maintenance_ceiling: state.maintenanceCeiling, updated_at: new Date().toISOString() });
+    setSyncMessage(error ? "Save error" : "Synced");
+  }
 
   const thisWeek = state.plannedActivities.filter((a) => weekDates.includes(a.date)).sort((a, b) => a.date.localeCompare(b.date));
   const completed = thisWeek.filter((a) => a.status === "completed");
@@ -152,136 +434,31 @@ export default function Dashboard() {
   const weightDelta = weights.current !== undefined && weights.previous !== undefined ? weights.current - weights.previous : undefined;
   const belowCeiling = weights.current !== undefined ? state.maintenanceCeiling - weights.current : undefined;
 
-  function shiftWeek(days: number) {
-    setViewWeekStartIso(localDateISO(addDays(viewedWeekStart, days)));
+  if (!supabase) {
+    return <main className="auth-shell"><section className="auth-card"><p className="eyebrow">SETUP NEEDED</p><h1>Cloud connection isn’t configured yet.</h1><p className="subtle">This build needs the two Supabase environment variables in Vercel.</p></section></main>;
   }
 
-  function openEdit(activity: PlannedActivity) {
-    setEditing(activity);
-    setEditCategory(activity.category);
-    setEditTitle(activity.title);
+  if (authLoading) return <main className="auth-shell"><section className="auth-card"><p className="eyebrow">PERSONAL FITNESS</p><h1>Loading…</h1></section></main>;
+
+  if (!session) {
+    return (
+      <main className="auth-shell">
+        <section className="auth-card">
+          <div className="auth-mark">F</div>
+          <p className="eyebrow">PERSONAL FITNESS</p>
+          <h1>Sign in to your dashboard</h1>
+          <p className="subtle">Use your email and we’ll send you a private sign-in link. No password required.</p>
+          <form className="auth-form" onSubmit={sendMagicLink}>
+            <label>Email<input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" autoComplete="email" /></label>
+            <button className="primary full" type="submit">Email me a sign-in link</button>
+          </form>
+          {authMessage && <p className="auth-message" aria-live="polite">{authMessage}</p>}
+        </section>
+      </main>
+    );
   }
 
-  function addPlannedActivity(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    const form = new FormData(e.currentTarget);
-    const date = String(form.get("date") || "");
-    const title = String(form.get("title") || "").trim();
-    const category = String(form.get("category") || "Other") as ActivityCategory;
-    const target = String(form.get("target") || "").trim();
-    const targetMilesRaw = String(form.get("targetMiles") || "").trim();
-    const targetMiles = category === "Run" && targetMilesRaw ? Number(targetMilesRaw) : undefined;
-    if (!date || !title) return;
-    setState((s) => ({
-      ...s,
-      plannedActivities: [...s.plannedActivities, {
-        id: uid("a"), date, title, category, target,
-        targetMiles: Number.isFinite(targetMiles) ? targetMiles : undefined,
-        status: "planned", source: "manual"
-      }]
-    }));
-    e.currentTarget.reset();
-    setAddCategory("Run");
-    setShowAdd(false);
-  }
-
-  function editPlannedActivity(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    if (!editing) return;
-    const form = new FormData(e.currentTarget);
-    const date = String(form.get("date") || editing.date);
-    const title = editTitle.trim();
-    const category = String(form.get("category") || editing.category) as ActivityCategory;
-    const target = String(form.get("target") || "").trim();
-    const targetMilesRaw = String(form.get("targetMiles") || "").trim();
-    const targetMiles = category === "Run" && targetMilesRaw ? Number(targetMilesRaw) : undefined;
-    if (!title) return;
-    setState((s) => ({
-      ...s,
-      plannedActivities: s.plannedActivities.map((a) => a.id === editing.id ? {
-        ...a, date, title, category, target,
-        targetMiles: Number.isFinite(targetMiles) ? targetMiles : undefined,
-      } : a)
-    }));
-    setEditing(null);
-  }
-
-  function logActivity(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    if (!logging) return;
-    const form = new FormData(e.currentTarget);
-    const milesRaw = String(form.get("miles") || "").trim();
-    const minutesRaw = String(form.get("minutes") || "").trim();
-    const notes = String(form.get("notes") || "").trim();
-    const miles = milesRaw ? Math.max(0, Math.min(200, Number(milesRaw))) : undefined;
-    const minutes = minutesRaw ? Math.max(0, Math.min(1000, Number(minutesRaw))) : undefined;
-    setState((s) => ({
-      ...s,
-      plannedActivities: s.plannedActivities.map((a) => a.id === logging.id ? {
-        ...a,
-        status: "completed",
-        actualMiles: Number.isFinite(miles) ? miles : undefined,
-        actualMinutes: Number.isFinite(minutes) ? minutes : undefined,
-        notes
-      } : a),
-    }));
-    setLogging(null);
-  }
-
-  function cloneToNextWeek() {
-    if (!thisWeek.length) return;
-    const nextStart = addDays(viewedWeekStart, 7);
-    const nextDates = dayNames.map((_, i) => localDateISO(addDays(nextStart, i)));
-    const existing = state.plannedActivities.some((a) => nextDates.includes(a.date));
-    if (existing && !window.confirm("The next week already has activities. Add another copy of this week's plan anyway?")) return;
-
-    const cloned = thisWeek.map((a) => {
-      const offset = weekDates.indexOf(a.date);
-      return {
-        id: uid("a"),
-        date: localDateISO(addDays(nextStart, Math.max(0, offset))),
-        title: a.title,
-        category: a.category,
-        target: a.target,
-        targetMiles: a.targetMiles,
-        status: "planned" as const,
-        source: "manual" as const,
-      };
-    });
-    setState((s) => ({ ...s, plannedActivities: [...s.plannedActivities, ...cloned] }));
-    setViewWeekStartIso(localDateISO(nextStart));
-  }
-
-  function markSkipped(id: string) {
-    setState((s) => ({ ...s, plannedActivities: s.plannedActivities.map((a) => a.id === id ? { ...a, status: "skipped" } : a) }));
-  }
-
-  function restore(id: string) {
-    setState((s) => ({ ...s, plannedActivities: s.plannedActivities.map((a) => a.id === id ? { ...a, status: "planned", actualMiles: undefined, actualMinutes: undefined, notes: undefined } : a) }));
-  }
-
-  function remove(id: string) {
-    setState((s) => ({ ...s, plannedActivities: s.plannedActivities.filter((a) => a.id !== id) }));
-  }
-
-  function saveMeasurement(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    const form = new FormData(e.currentTarget);
-    const date = String(form.get("measureDate") || localDateISO(new Date()));
-    const weightRaw = String(form.get("weight") || "").trim();
-    const waistRaw = String(form.get("waist") || "").trim();
-    const weight = weightRaw ? Number(weightRaw) : undefined;
-    const waist = waistRaw ? Number(waistRaw) : undefined;
-    if ((weight === undefined || !Number.isFinite(weight)) && (waist === undefined || !Number.isFinite(waist))) return;
-    const entry: Measurement = { id: uid("m"), date, weight: weight && weight > 0 ? weight : undefined, waist: waist && waist > 0 ? waist : undefined };
-    setState((s) => ({ ...s, measurements: [...s.measurements.filter((m) => m.date !== date), entry].sort((a, b) => a.date.localeCompare(b.date)) }));
-    e.currentTarget.reset();
-  }
-
-  function updateCeiling(value: string) {
-    const num = Number(value);
-    if (Number.isFinite(num) && num >= 80 && num <= 300) setState((s) => ({ ...s, maintenanceCeiling: num }));
-  }
+  if (cloudLoading) return <main className="auth-shell"><section className="auth-card"><p className="eyebrow">PERSONAL FITNESS</p><h1>Loading your data…</h1><p className="subtle">Your dashboard is syncing from Supabase.</p></section></main>;
 
   return (
     <main className="app-shell">
@@ -293,7 +470,7 @@ export default function Dashboard() {
           <a className="nav-link" href="#progress">Progress</a>
           <a className="nav-link" href="#goals">Goals</a>
         </nav>
-        <div className="integration-note"><span className="status-dot" /> Strava-ready data model</div>
+        <div className="integration-note"><span className="status-dot" /> Strava-ready</div>
       </aside>
 
       <section className="content" id="dashboard">
@@ -303,14 +480,17 @@ export default function Dashboard() {
             <h1>{isCurrentWeek ? "This Week" : "Weekly Plan"}</h1>
             <p className="subtle">{formatRange(viewedWeekStart)}</p>
           </div>
-          <button className="primary" onClick={() => { setAddCategory("Run"); setShowAdd(true); }}>+ Add to plan</button>
+          <div className="head-actions">
+            <div className="cloud-chip"><span className="status-dot" /> {syncMessage}<button type="button" onClick={signOut}>Sign out</button></div>
+            <button className="primary" onClick={() => { setAddCategory("Run"); setShowAdd(true); }}>+ Add to plan</button>
+          </div>
         </header>
 
         <div className="week-toolbar" aria-label="Week navigation">
           <div className="week-nav-group">
-            <button className="ghost-btn nav-week" onClick={() => shiftWeek(-7)}>← Previous</button>
+            <button className="ghost-btn nav-week" onClick={() => setViewWeekStartIso(localDateISO(addDays(viewedWeekStart, -7)))}>← Previous</button>
             {!isCurrentWeek && <button className="ghost-btn nav-week" onClick={() => setViewWeekStartIso(currentWeekStartIso)}>Current week</button>}
-            <button className="ghost-btn nav-week" onClick={() => shiftWeek(7)}>Next →</button>
+            <button className="ghost-btn nav-week" onClick={() => setViewWeekStartIso(localDateISO(addDays(viewedWeekStart, 7)))}>Next →</button>
           </div>
           <button className="clone-btn" onClick={cloneToNextWeek} disabled={!thisWeek.length}>Clone this week →</button>
         </div>
@@ -335,23 +515,12 @@ export default function Dashboard() {
                   <div className="day-items">
                     {items.length === 0 ? <div className="empty-slot">No activity planned</div> : items.map((a) => (
                       <article className={`activity ${a.status}`} key={a.id}>
-                        <div className="activity-main">
-                          <div className={`category-dot cat-${a.category.toLowerCase()}`} />
-                          <div>
-                            <div className="activity-title">{a.title}</div>
-                            <div className="activity-meta">
-                              {a.category}
-                              {a.category === "Run" && a.targetMiles ? ` · ${a.targetMiles.toFixed(1)} mi planned` : ""}
-                              {a.target ? ` · ${a.target}` : ""}
-                              {a.status === "completed" && (a.actualMiles || a.actualMinutes) ? ` · actual ${a.actualMiles ? `${a.actualMiles.toFixed(1)} mi` : ""}${a.actualMiles && a.actualMinutes ? " · " : ""}${a.actualMinutes ? `${a.actualMinutes} min` : ""}` : ""}
-                            </div>
-                          </div>
-                        </div>
+                        <div className="activity-main"><div className={`category-dot cat-${a.category.toLowerCase()}`} /><div><div className="activity-title">{a.title}</div><div className="activity-meta">{a.category}{a.category === "Run" && a.targetMiles ? ` · ${a.targetMiles.toFixed(1)} mi planned` : ""}{a.target ? ` · ${a.target}` : ""}{a.status === "completed" && (a.actualMiles || a.actualMinutes) ? ` · actual ${a.actualMiles ? `${a.actualMiles.toFixed(1)} mi` : ""}${a.actualMiles && a.actualMinutes ? " · " : ""}${a.actualMinutes ? `${a.actualMinutes} min` : ""}` : ""}</div></div></div>
                         <div className="activity-actions">
                           <button className="ghost-btn" onClick={() => openEdit(a)}>Edit</button>
-                          {a.status === "planned" && <><button className="small-btn" onClick={() => setLogging(a)}>Log</button><button className="ghost-btn" onClick={() => markSkipped(a.id)}>Skip</button></>}
-                          {a.status === "completed" && <><button className="small-btn" onClick={() => setLogging(a)}>Edit log</button><button className="ghost-btn" onClick={() => restore(a.id)}>Undo</button></>}
-                          {a.status === "skipped" && <button className="ghost-btn" onClick={() => restore(a.id)}>Undo</button>}
+                          {a.status === "planned" && <><button className="small-btn" onClick={() => setLogging(a)}>Log</button><button className="ghost-btn" onClick={() => updateActivityStatus(a.id, "skipped")}>Skip</button></>}
+                          {a.status === "completed" && <><button className="small-btn" onClick={() => setLogging(a)}>Edit log</button><button className="ghost-btn" onClick={() => updateActivityStatus(a.id, "planned", true)}>Undo</button></>}
+                          {a.status === "skipped" && <button className="ghost-btn" onClick={() => updateActivityStatus(a.id, "planned")}>Undo</button>}
                           <button className="icon-btn" aria-label={`Delete ${a.title}`} onClick={() => remove(a.id)}>×</button>
                         </div>
                       </article>
@@ -369,7 +538,6 @@ export default function Dashboard() {
             <WeightSparkline measurements={state.measurements} />
             <div className="trend-footer"><span>Maintenance ceiling</span><strong>{state.maintenanceCeiling.toFixed(0)} lb</strong></div>
           </article>
-
           <article className="panel checkin-panel">
             <div className="panel-head compact"><div><p className="eyebrow">CHECK-IN</p><h2>Weight & waist</h2></div><div className="waist-latest"><small>Latest waist</small><strong>{latestWaist ? `${latestWaist.toFixed(1)} in` : "—"}</strong></div></div>
             <form className="checkin-form" onSubmit={saveMeasurement}>
@@ -383,51 +551,17 @@ export default function Dashboard() {
 
         <section className="panel goals-panel" id="goals">
           <div><p className="eyebrow">GOALS</p><h2>Maintenance settings</h2><p className="subtle">Individual weigh-ins can bounce around. The dashboard watches your 30-day average.</p></div>
-          <label className="goal-control">30-day average stays below <span className="goal-input-wrap"><input aria-label="Maintenance ceiling" type="number" min="80" max="300" step="0.5" value={state.maintenanceCeiling} onChange={(e) => updateCeiling(e.target.value)} /> lb</span></label>
+          <label className="goal-control">30-day average stays below <span className="goal-input-wrap"><input aria-label="Maintenance ceiling" type="number" min="80" max="300" step="0.5" value={state.maintenanceCeiling} onChange={(e) => updateCeiling(e.target.value)} onBlur={saveCeiling} /> lb</span></label>
         </section>
 
-        <footer className="app-footer">Data is stored in this browser for this MVP. Supabase sync and Strava import are the next integration steps.</footer>
+        <footer className="app-footer">Your data is synced privately through Supabase. Strava import is next.</footer>
       </section>
 
-      {showAdd && <div className="modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) setShowAdd(false); }}>
-        <section className="modal" role="dialog" aria-modal="true" aria-labelledby="add-title">
-          <div className="modal-head"><div><p className="eyebrow">PLAN</p><h2 id="add-title">Add activity</h2></div><button className="icon-btn" onClick={() => setShowAdd(false)} aria-label="Close">×</button></div>
-          <form onSubmit={addPlannedActivity} className="modal-form">
-            <label>Date<select name="date" defaultValue={weekDates[0]}>{weekDates.map((date, i) => <option key={date} value={date}>{dayNames[i]} · {parseLocalDate(date).toLocaleDateString("en-US", { month: "short", day: "numeric" })}</option>)}</select></label>
-            <label>Activity<input name="title" required maxLength={60} placeholder="e.g. Hill drills" /></label>
-            <label>Type<select name="category" value={addCategory} onChange={(e) => setAddCategory(e.target.value as ActivityCategory)}>{categories.map((c) => <option key={c}>{c}</option>)}</select></label>
-            {addCategory === "Run" && <label>Planned distance <span>(miles)</span><input name="targetMiles" type="number" min="0" max="200" step="0.1" inputMode="decimal" placeholder="e.g. 5.0" /></label>}
-            <label>Target / notes<input name="target" maxLength={80} placeholder="e.g. Zone 2, easy effort" /></label>
-            <button className="primary full" type="submit">Add to this week</button>
-          </form>
-        </section>
-      </div>}
+      {showAdd && <div className="modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) setShowAdd(false); }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="add-title"><div className="modal-head"><div><p className="eyebrow">PLAN</p><h2 id="add-title">Add activity</h2></div><button className="icon-btn" onClick={() => setShowAdd(false)} aria-label="Close">×</button></div><form onSubmit={addPlannedActivity} className="modal-form"><label>Date<select name="date" defaultValue={weekDates[0]}>{weekDates.map((date, i) => <option key={date} value={date}>{dayNames[i]} · {parseLocalDate(date).toLocaleDateString("en-US", { month: "short", day: "numeric" })}</option>)}</select></label><label>Activity<input name="title" required maxLength={60} placeholder="e.g. Hill drills" /></label><label>Type<select name="category" value={addCategory} onChange={(e) => setAddCategory(e.target.value as ActivityCategory)}>{categories.map((c) => <option key={c}>{c}</option>)}</select></label>{addCategory === "Run" && <label>Planned distance <span>(miles)</span><input name="targetMiles" type="number" min="0" max="200" step="0.1" inputMode="decimal" placeholder="e.g. 5.0" /></label>}<label>Target / notes<input name="target" maxLength={80} placeholder="e.g. Zone 2, easy effort" /></label><button className="primary full" type="submit">Add to this week</button></form></section></div>}
 
-      {editing && <div className="modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) setEditing(null); }}>
-        <section className="modal" role="dialog" aria-modal="true" aria-labelledby="edit-title">
-          <div className="modal-head"><div><p className="eyebrow">EDIT PLAN</p><h2 id="edit-title">{editTitle || "Untitled activity"}</h2></div><button className="icon-btn" onClick={() => setEditing(null)} aria-label="Close">×</button></div>
-          <form key={editing.id} onSubmit={editPlannedActivity} className="modal-form">
-            <label>Day<select name="date" defaultValue={editing.date}>{weekDates.map((date, i) => <option key={date} value={date}>{dayNames[i]} · {parseLocalDate(date).toLocaleDateString("en-US", { month: "short", day: "numeric" })}</option>)}</select></label>
-            <label>Activity<input name="title" required maxLength={60} value={editTitle} onChange={(e) => setEditTitle(e.target.value)} /></label>
-            <label>Type<select name="category" value={editCategory} onChange={(e) => setEditCategory(e.target.value as ActivityCategory)}>{categories.map((c) => <option key={c}>{c}</option>)}</select></label>
-            {editCategory === "Run" && <label>Planned distance <span>(miles)</span><input name="targetMiles" type="number" min="0" max="200" step="0.1" inputMode="decimal" defaultValue={editing.targetMiles ?? ""} placeholder="e.g. 5.0" /></label>}
-            <label>Target / notes<input name="target" maxLength={80} defaultValue={editing.target || ""} /></label>
-            <button className="primary full" type="submit">Save changes</button>
-          </form>
-        </section>
-      </div>}
+      {editing && <div className="modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) setEditing(null); }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="edit-title"><div className="modal-head"><div><p className="eyebrow">EDIT PLAN</p><h2 id="edit-title">{editTitle || "Untitled activity"}</h2></div><button className="icon-btn" onClick={() => setEditing(null)} aria-label="Close">×</button></div><form key={editing.id} onSubmit={editPlannedActivity} className="modal-form"><label>Day<select name="date" defaultValue={editing.date}>{weekDates.map((date, i) => <option key={date} value={date}>{dayNames[i]} · {parseLocalDate(date).toLocaleDateString("en-US", { month: "short", day: "numeric" })}</option>)}</select></label><label>Activity<input name="title" required maxLength={60} value={editTitle} onChange={(e) => setEditTitle(e.target.value)} /></label><label>Type<select name="category" value={editCategory} onChange={(e) => setEditCategory(e.target.value as ActivityCategory)}>{categories.map((c) => <option key={c}>{c}</option>)}</select></label>{editCategory === "Run" && <label>Planned distance <span>(miles)</span><input name="targetMiles" type="number" min="0" max="200" step="0.1" inputMode="decimal" defaultValue={editing.targetMiles ?? ""} placeholder="e.g. 5.0" /></label>}<label>Target / notes<input name="target" maxLength={80} defaultValue={editing.target || ""} /></label><button className="primary full" type="submit">Save changes</button></form></section></div>}
 
-      {logging && <div className="modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) setLogging(null); }}>
-        <section className="modal" role="dialog" aria-modal="true" aria-labelledby="log-title">
-          <div className="modal-head"><div><p className="eyebrow">{logging.status === "completed" ? "EDIT ACTUAL" : "LOG ACTIVITY"}</p><h2 id="log-title">{logging.title}</h2><p className="subtle">{logging.category === "Run" && logging.targetMiles ? `${logging.targetMiles.toFixed(1)} mi planned${logging.target ? ` · ${logging.target}` : ""}` : logging.target || logging.category}</p></div><button className="icon-btn" onClick={() => setLogging(null)} aria-label="Close">×</button></div>
-          <form onSubmit={logActivity} className="modal-form">
-            {logging.category === "Run" && <label>Actual distance <span>(miles)</span><input name="miles" type="number" min="0" max="200" step="0.1" inputMode="decimal" defaultValue={logging.actualMiles ?? logging.targetMiles ?? ""} /></label>}
-            <label>Duration <span>(minutes, optional)</span><input name="minutes" type="number" min="0" max="1000" step="1" inputMode="numeric" defaultValue={logging.actualMinutes ?? ""} /></label>
-            <label>Notes<textarea name="notes" rows={3} defaultValue={logging.notes || ""} placeholder="How it felt, weights used, anything worth remembering" /></label>
-            <button className="primary full" type="submit">{logging.status === "completed" ? "Save actuals" : "Mark complete"}</button>
-          </form>
-        </section>
-      </div>}
+      {logging && <div className="modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) setLogging(null); }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="log-title"><div className="modal-head"><div><p className="eyebrow">{logging.status === "completed" ? "EDIT ACTUAL" : "LOG ACTIVITY"}</p><h2 id="log-title">{logging.title}</h2><p className="subtle">{logging.category === "Run" && logging.targetMiles ? `${logging.targetMiles.toFixed(1)} mi planned${logging.target ? ` · ${logging.target}` : ""}` : logging.target || logging.category}</p></div><button className="icon-btn" onClick={() => setLogging(null)} aria-label="Close">×</button></div><form onSubmit={logActivity} className="modal-form">{logging.category === "Run" && <label>Actual distance <span>(miles)</span><input name="miles" type="number" min="0" max="200" step="0.1" inputMode="decimal" defaultValue={logging.actualMiles ?? logging.targetMiles ?? ""} /></label>}<label>Duration <span>(minutes, optional)</span><input name="minutes" type="number" min="0" max="1000" step="1" inputMode="numeric" defaultValue={logging.actualMinutes ?? ""} /></label><label>Notes<textarea name="notes" rows={3} defaultValue={logging.notes || ""} placeholder="How it felt, weights used, anything worth remembering" /></label><button className="primary full" type="submit">{logging.status === "completed" ? "Save actuals" : "Mark complete"}</button></form></section></div>}
     </main>
   );
 }

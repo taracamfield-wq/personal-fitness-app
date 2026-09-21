@@ -1,5 +1,5 @@
 {
-  "name": "fitness-goals-app-v4",
+  "name": "fitness-goals-app-v5",
   "private": true,
   "scripts": {
     "dev": "next dev",

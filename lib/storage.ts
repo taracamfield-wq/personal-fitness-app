@@ -1,9 +1,7 @@
 import type { FitnessState } from "./types";
 
-const KEY = "fitness-dashboard-v4";
-const PREVIOUS_KEY = "fitness-dashboard-v3";
-const OLDER_KEY = "fitness-dashboard-v2";
-const LEGACY_KEY = "fitness-dashboard-v1";
+const KEYS = ["fitness-dashboard-v4", "fitness-dashboard-v3", "fitness-dashboard-v2"];
+const CACHE_KEY = "fitness-dashboard-v5-cache";
 
 function safeParse(raw: string | null): FitnessState | null {
   if (!raw) return null;
@@ -14,43 +12,32 @@ function safeParse(raw: string | null): FitnessState | null {
   }
 }
 
-function normalize(state: FitnessState, fallback: FitnessState): FitnessState {
-  return {
-    plannedActivities: Array.isArray(state.plannedActivities) ? state.plannedActivities : fallback.plannedActivities,
-    measurements: Array.isArray(state.measurements) ? state.measurements : fallback.measurements,
-    maintenanceCeiling: Number.isFinite(state.maintenanceCeiling) ? state.maintenanceCeiling : fallback.maintenanceCeiling,
-  };
+function validState(state: FitnessState | null): state is FitnessState {
+  return !!state && Array.isArray(state.plannedActivities) && Array.isArray(state.measurements);
 }
 
-export function loadState(fallback: FitnessState): FitnessState {
-  if (typeof window === "undefined") return fallback;
-
-  const current = safeParse(window.localStorage.getItem(KEY));
-  if (current) return normalize(current, fallback);
-
-  // Preserve everything entered in v3, including cloned weeks and edits.
-  const previous = safeParse(window.localStorage.getItem(PREVIOUS_KEY));
-  if (previous) return normalize(previous, fallback);
-
-  // Preserve v2 data if v3 was never used.
-  const older = safeParse(window.localStorage.getItem(OLDER_KEY));
-  if (older) return normalize(older, fallback);
-
-  // Older prototype migration: preserve measurements and maintenance ceiling,
-  // but use the current Sunday-based fallback plan.
-  const legacy = safeParse(window.localStorage.getItem(LEGACY_KEY));
-  if (legacy) {
-    return {
-      plannedActivities: fallback.plannedActivities,
-      measurements: Array.isArray(legacy.measurements) ? legacy.measurements : fallback.measurements,
-      maintenanceCeiling: Number.isFinite(legacy.maintenanceCeiling) ? legacy.maintenanceCeiling : fallback.maintenanceCeiling,
-    };
+export function loadStoredState(): FitnessState | null {
+  if (typeof window === "undefined") return null;
+  for (const key of KEYS) {
+    const parsed = safeParse(window.localStorage.getItem(key));
+    if (validState(parsed)) {
+      return {
+        plannedActivities: parsed.plannedActivities,
+        measurements: parsed.measurements,
+        maintenanceCeiling: Number.isFinite(parsed.maintenanceCeiling) ? parsed.maintenanceCeiling : 125,
+      };
+    }
   }
-
-  return fallback;
+  return null;
 }
 
-export function saveState(state: FitnessState) {
+export function loadCloudCache(): FitnessState | null {
+  if (typeof window === "undefined") return null;
+  const parsed = safeParse(window.localStorage.getItem(CACHE_KEY));
+  return validState(parsed) ? parsed : null;
+}
+
+export function saveCloudCache(state: FitnessState) {
   if (typeof window === "undefined") return;
-  window.localStorage.setItem(KEY, JSON.stringify(state));
+  window.localStorage.setItem(CACHE_KEY, JSON.stringify(state));
 }
